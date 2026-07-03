@@ -933,6 +933,7 @@ int main(int argc, char *argv[]) {
             execute_commands(&client);
         }
         cleanup(&client);
+        printf("Disconnected. Reconnecting in 10s...\n");
         sleep(10);
 
         memset(&client.crypto_ctx, 0, sizeof(client.crypto_ctx));
