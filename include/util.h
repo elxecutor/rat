@@ -13,4 +13,7 @@ int recv_all(socket_t fd, void *data, size_t len, int flags);
 // Extract base filename from path (handles both / and \ regardless of OS)
 const char *find_base_name(const char *path);
 
+// Connect to a .onion host through a SOCKS5 proxy
+int socks5_connect(socket_t proxy_fd, const char *host, uint16_t port);
+
 #endif // UTIL_H

