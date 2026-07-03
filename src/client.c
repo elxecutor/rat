@@ -928,8 +928,10 @@ int main(int argc, char *argv[]) {
 #endif
     
     for (;;) {
-        if (connect_to_server(&client) == 0)
-            break;
+        if (connect_to_server(&client) == 0) {
+            printf("Connected to server at %s:%d\n", client.host, client.port);
+            execute_commands(&client);
+        }
         cleanup(&client);
         sleep(10);
 
@@ -943,11 +945,4 @@ int main(int argc, char *argv[]) {
         client.client_fd = -1;
 #endif
     }
-    
-    printf("Connected to server at %s:%d\n", client.host, client.port);
-    
-    execute_commands(&client);
-    
-    cleanup(&client);
-    return 0;
 }
