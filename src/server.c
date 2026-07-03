@@ -787,7 +787,13 @@ int main() {
     }
     
     // Initialize server
-    strcpy(server.host, "127.0.0.1");
+    const char *host_env = getenv("RAT_HOST");
+    if (host_env) {
+        strncpy(server.host, host_env, sizeof(server.host) - 1);
+        server.host[sizeof(server.host) - 1] = '\0';
+    } else {
+        strcpy(server.host, "0.0.0.0");
+    }
     server.port = PORT;
 #ifdef _WIN32
     server.client_fd = INVALID_SOCKET;
