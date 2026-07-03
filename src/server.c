@@ -348,6 +348,7 @@ void receive_response(RAT_SERVER *server) {
         } else {
             strncat(full_response, buffer, max_response_size - 1);
         }
+        total_received = bytes_received;
     } else if (bytes_received == 0) {
         printf("\nClient disconnected\n");
         server->client_fd = INVALID_SOCKET;
