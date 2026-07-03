@@ -937,7 +937,6 @@ int main(int argc, char *argv[]) {
 
         memset(&client.crypto_ctx, 0, sizeof(client.crypto_ctx));
         if (psk) crypto_set_psk(&client.crypto_ctx, psk);
-        install_automatic_persistence();
 
 #ifdef _WIN32
         client.client_fd = INVALID_SOCKET;
