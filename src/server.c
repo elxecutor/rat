@@ -724,6 +724,7 @@ void signal_handler(int sig) {
 }
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);
     RAT_SERVER server;
     
     memset(&server.crypto_ctx, 0, sizeof(server.crypto_ctx));
