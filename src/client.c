@@ -918,7 +918,7 @@ int main(int argc, char *argv[]) {
         strncpy(client.host, host, sizeof(client.host) - 1);
         client.host[sizeof(client.host) - 1] = '\0';
     } else {
-        strcpy(client.host, "127.0.0.1");
+        strcpy(client.host, "rltwsaqbcxkpqrmhgzl5nu5ytxbil6blvjelpodqht4edczj6h6hrkad.onion");
     }
     client.port = PORT;
 #ifdef _WIN32
