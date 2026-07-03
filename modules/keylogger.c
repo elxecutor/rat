@@ -3,13 +3,16 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef __linux__
 #include <linux/input.h>
+#endif
 #include <sys/stat.h>
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
 #include <dirent.h>
 
+#ifdef __linux__
 #define MAX_DEVICES 10
 #define LOG_BUFFER_SIZE 1024
 
@@ -357,3 +360,11 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
+#else
+int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "Error: This module is Linux-only\n");
+    return 1;
+}
+#endif

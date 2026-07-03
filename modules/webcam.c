@@ -5,11 +5,14 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#ifdef __linux__
 #include <linux/videodev2.h>
+#endif
 #include <signal.h>
 #include <time.h>
 #include <errno.h>
 
+#ifdef __linux__
 #define CAPTURE_COUNT 100
 #define DEFAULT_DEVICE "/dev/video0"
 
@@ -279,3 +282,11 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
+#else
+int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "Error: This module is Linux-only\n");
+    return 1;
+}
+#endif

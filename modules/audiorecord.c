@@ -4,10 +4,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#ifdef __linux__
 #include <linux/soundcard.h>
+#endif
 #include <signal.h>
 #include <time.h>
 
+#ifdef __linux__
 #define SAMPLE_RATE 44100
 #define CHANNELS 1
 #define BITS_PER_SAMPLE 16
@@ -127,3 +130,11 @@ int main(int argc, char *argv[]) {
     
     return 0;
 }
+#else
+int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    fprintf(stderr, "Error: This module is Linux-only\n");
+    return 1;
+}
+#endif

